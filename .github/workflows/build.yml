@@ -98,6 +98,164 @@ jobs:
         
     - name: Configure system inside chroot
       run: |
+        sudo tee /mnt/debian-rootfs/chroot-setup.sh > /dev/null << 'SCRIPT_EOF'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C
+
+echo 'xiaomi-mido' > /etc/hostname
+echo '127.0.0.1 xiaomi-mido' >> /etc/hosts
+
+cat > /etc/apt/sources.list << 'SOURCES_EOF'
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free-firmware
+deb https://mirrors.tuna.tsinghua.edu.cn/debian-security trixie-security main contrib non-free-firmware
+SOURCES_EOF
+
+apt-get update
+apt-get install -y \
+  apt-transport-https ca-certificates locales locales-all \
+  systemd systemd-sysv initramfs-tools \
+  network-manager openssh-server sudo \
+  firmware-qcom-soc alsa-ucm-conf \
+  zram-tools bluez iio-sensor-proxy \
+  console-setup kbd
+
+dpkg -i /tmp/linux-image-*.deb
+dpkg -i /tmp/linux-libc-dev_*.deb
+
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+locale-gen
+
+cat >> /etc/initramfs-tools/modules << 'MODULES_EOF'
+edt_ft5x06
+goodix_ts
+msm
+panel_xiaomi_boe_ili9885
+panel_xiaomi_ebbg_r63350
+panel_xiaomi_nt35532
+panel_xiaomi_otm1911
+panel_xiaomi_tianma_nt35596
+MODULES_EOF
+
+cat > /etc/initramfs-tools/hooks/mido-fw << 'HOOK_EOF'
+#!/bin/sh
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in prereqs) prereqs; exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+add_firmware qcom/msm8953/xiaomi/mido/a506_zap.mdt
+add_firmware qcom/msm8953/xiaomi/mido/a506_zap.elf
+add_firmware qcom/msm8953/xiaomi/mido/a506_zap.b00
+add_firmware qcom/msm8953/xiaomi/mido/a506_zap.b01
+add_firmware qcom/msm8953/xiaomi/mido/a506_zap.b02
+HOOK_EOF
+
+chmod +x /etc/initramfs-tools/hooks/mido-fw
+update-initramfs -u -k $KERNEL_VERSION
+
+useradd -m -s /bin/bash user
+echo "user:user" | chpasswd
+usermod -aG sudo,audio,video,render,input,netdev,plugdev,bluetooth user
+
+systemctl enable serial-getty@ttyGS0.service
+systemctl enable NetworkManager
+systemctl enable ssh
+
+apt-get clean
+rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+SCRIPT_EOF
+
+        sudo chmod +x /mnt/debian-rootfs/chroot-setup.sh
+        sudo chroot /mnt/debian-rootfs /bin/bash /chroot-setup.sh
+        
+    - name: Create boot partition
+      run: |
+        dd if=/dev/zero of=bootfs.img bs=1M count=1024
+        mkfs.ext2 -F bootfs.img
+        
+        sudo mkdir -p /mnt/debian-boot
+        sudo mount -o loop bootfs.img /mnt/debian-boot
+        
+        sudo cp /mnt/debian-rootfs/boot/vmlinuz-${{ env.KERNEL_VERSION }} /mnt/debian-boot/
+        sudo cp /mnt/debian-rootfs/boot/initrd.img-${{ env.KERNEL_VERSION }} /mnt/debian-boot/
+        sudo cp /mnt/debian-rootfs/usr/lib/linux-image-${{ env.KERNEL_VERSION }}/qcom/*mido* /mnt/debian-boot/
+        
+        sudo mkdir -p /mnt/debian-boot/extlinux
+        sudo tee /mnt/debian-boot/extlinux/extlinux.conf > /dev/null << 'EOF'
+timeout 1
+default Debian
+
+label Debian
+  kernel /vmlinuz-6.16.3-calicocat-msm8953+
+  fdtdir /
+  initrd /initrd.img-6.16.3-calicocat-msm8953+
+  append console=tty0 root=LABEL=ROOTFS rw loglevel=3 splash
+EOF
+        
+        sudo umount /mnt/debian-boot
+        
+    - name: Clean up and unmount
+      run: |
+        sudo umount /mnt/debian-rootfs/proc
+        sudo umount /mnt/debian-rootfs/sys
+        sudo umount /mnt/debian-rootfs/dev/pts
+        sudo umount /mnt/debian-rootfs/dev
+        sudo umount /mnt/debian-rootfs
+        
+    - name: Convert to sparse images
+      run: |
+        img2simg rootfs.img rootfs-sparse.img
+        img2simg bootfs.img bootfs-sparse.img
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: debian-mido-build
+        path: |
+          lk2nd/build-lk2nd-msm8953/lk2nd.img
+          bootfs-sparse.img
+          rootfs-sparse.img
+        retention-days: 30        cp -r proprietary_firmware_mido/modem/* firmware/
+        mv firmware/a506* firmware/qcom/msm8953/xiaomi/mido/
+        
+    - name: Build lk2nd with modifications
+      run: |
+        cd lk2nd
+        sed -i 's/#define MAX_RAMDISK_SIZE (16 \* 1024 \* 1024)/#define MAX_RAMDISK_SIZE (50 \* 1024 \* 1024)/' boot/extlinux.c
+        sed -i 's/touchscreen-compatible = "edt,edt-ft5406";/touchscreen-compatible = "goodix,gt917d";/g' device/dts/msm8953/msm8953-xiaomi-common.dts
+        make TOOLCHAIN_PREFIX=arm-none-eabi- lk2nd-msm8953
+        cd ..
+        
+    - name: Create root filesystem image
+      run: |
+        dd if=/dev/zero of=rootfs.img bs=1M count=3072
+        mkfs.ext4 -F rootfs.img
+        sudo mkdir -p /mnt/debian-rootfs
+        sudo mount -o loop rootfs.img /mnt/debian-rootfs
+        
+    - name: Bootstrap Debian system
+      run: |
+        sudo qemu-debootstrap \
+          --arch=arm64 \
+          --variant=minbase \
+          ${{ env.DEBIAN_VERSION }} \
+          /mnt/debian-rootfs \
+          https://mirrors.tuna.tsinghua.edu.cn/debian/
+          
+    - name: Prepare chroot environment
+      run: |
+        sudo mount -t proc /proc /mnt/debian-rootfs/proc
+        sudo mount -t sysfs /sys /mnt/debian-rootfs/sys
+        sudo mount -o bind /dev /mnt/debian-rootfs/dev
+        sudo mount -o bind /dev/pts /mnt/debian-rootfs/dev/pts
+        sudo cp -r firmware/* /mnt/debian-rootfs/lib/firmware/
+        sudo cp -r alsa-ucm-conf/ucm2/* /mnt/debian-rootfs/usr/share/alsa/ucm2/
+        sudo cp linux*deb /mnt/debian-rootfs/tmp/
+        
+    - name: Configure system inside chroot
+      run: |
         cat > /tmp/chroot-setup.sh << 'EOF'
 #!/bin/bash
 set -e
